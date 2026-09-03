@@ -11,6 +11,8 @@
 - **`normal_df`**：风机**正常运行**的数据点——功率落在该风速区间应有的功率带内。**后续做功率曲线建模、工况分析、机器学习等时主要用这一份**。
 - **`abnormal_df`**：其余所有被剔除的点。⚠️ **它不是"严格异常集"**，而是混了多种情况：停机、故障、限电/降载、桨距控制等**其它工况**、以及真正的传感器/数据异常。想区分异常类型，需要后续用更高阶方法（如 GAM/sigmoid 拟合、时间维度分析）处理。
 
+> 想识别**限电/降载/停机成片出现、单点看却落在正常带内**的"隐藏异常"，以及逐点打上 `normal/abnormal` **标签并区分异常类型**，请用 [DailyAnomalyDetector](#dailyanomalydetector时间维度异常检测v2)（v2，时间维度 + 基准曲线对比）。`PowerCurveFiltering`（v1）是无模型的 bin+MAD 粗洗，适合作为对照或初筛。
+
 单台风机的整条清洗流水线分三步：
 
 1. **去停机**：风速 ≥ 切入风速、但功率 ≤ 1 kW 的点（风机已停机）→ 剔除。
@@ -22,6 +24,88 @@
 - 箱内样本 < 3，或功率离散度为 0（典型如额定功率平台），该箱**不判定、直接保留**；
 - 风速低于切入风速的点默认保留（近零功率属正常待机）；
 - 恒定功率的"水平聚集"类异常（如某段时间被固定在某一功率）**bin+MAD 识别不出来**，这是本方法的能力上限，应交给后续更精细的方案。
+
+## DailyAnomalyDetector：时间维度异常检测（v2）
+
+核心思路（来自 2020 国家电投"绿动未来"大赛 top1 方案）：**降维 + 对比**。先把单台风机的正常点压成一条基准功率曲线，再按天（或未来按小时）把每天的运行段压缩成"中位残差"，与整机曲线对比——某天整体偏移明显，就把该天判为异常，并给逐点打标签。它比纯 bin+MAD 能抓到**水平聚集 / 限电 / 降载**这类单点统计标不出的异常。
+
+### 快速开始
+
+```python
+import pandas as pd
+from wtclean import DailyAnomalyDetector
+
+df = pd.read_csv("data.csv")
+turbine = df[df["Wind_turbine_name"] == "R80721"]   # 单台风机
+
+detector = DailyAnomalyDetector(
+    windspeed_label="Ws_avg",     # 风速列名
+    power_label="P_avg",          # 有功功率列名
+    timestamp_label="Date_time",  # 时间戳列名（datetime 或可解析字符串）
+    df=turbine,                   # 单台风机数据
+    # —— 以下物理参数缺省时会从 SCADA 自动反推（见下）——
+    cut_in_speed=3.5,             # 切入风速 m/s
+    rated_wind_speed=14.5,        # 额定风速 m/s
+    rated_power=2050,             # 额定功率 kW
+    cut_out_speed=25.0,           # 切出风速 m/s（可选；给定后切出以上近零功率视为正常停机）
+)
+
+normal_df, abnormal_df = detector.detect()
+
+detector.labels_           # pd.Series：每行一个标签
+detector.abnormal_days_    # set：被判异常的天（日期）
+detector.removal_counts_   # dict：各类异常点数统计
+```
+
+### 输出标签含义
+
+`detect()` 返回 `(normal_df, abnormal_df)` 两个 DataFrame，按行切分原始 `df`（`normal_df + abnormal_df == 原始 df`，且索引不交叠）。每个点的异常类型看 `detector.labels_`：
+
+| 标签 | 含义 |
+| --- | --- |
+| `normal` | 正常 |
+| `nan` | 缺失：风速或功率为 NaN |
+| `range` | 越界：功率/风速为负，或功率 > 1.2×额定功率（切出风速以上功率非零也算） |
+| `downtime` | 停机：切入风速以上、功率却近零（≤ `downtime_power`） |
+| `curtailment` | 限电：额定风速以上、功率 < `low_power_ratio`×额定功率（高风低功率） |
+| `temporal` | 时间维度异常：整天的运行段整体偏离基准曲线（限电/降载/停机方向） |
+| `residual` | 逐点残差异常：单点相对基准曲线的残差超出该风速 bin 的 `z_coeff`×MAD 带 |
+
+优先级：粗洗四类（nan/range/downtime/curtailment）> `temporal` > `residual` > `normal`，即时间维度与残差只作用于尚未被粗洗标异常的点。
+
+### 检测流程
+
+1. **粗洗掩码**：`nan` / `range` / `downtime` / `curtailment` 直接判异常，不参与后续建模。
+2. **整机基准曲线**：用 `base_method`（默认 `gam` 单调 GAM，也可 `logistic_5_parametric` / `iec`）在粗洗后的点上拟合。
+3. **残差**：`resid = power - base(wind_speed)`。
+4. **天级判定**：每天"切入风速以上"点的中位残差 = 该天系统性偏移；跨天用 `median + day_z_coeff×MAD` 自适应阈值标异常天（默认只标"低于曲线"方向）。
+5. **逐点残差 bin-MAD 精洗**：按 `bin_width` 风速分箱，对残差做 `z_coeff×MAD` 带外判定（异方差）。
+6. 输出 `(normal_df, abnormal_df)`。
+
+### 参数说明
+
+| 参数 | 默认 | 含义 |
+| --- | --- | --- |
+| `windspeed_label` / `power_label` / `timestamp_label` | — | 风速/功率/时间戳列名（必填）。 |
+| `df` | — | **单台**风机的 SCADA DataFrame（必填）。 |
+| `cut_in_speed` / `rated_wind_speed` / `rated_power` | 自动反推 | 厂商物理参数；缺省时调用 `estimate_machine_parameters` 反推。 |
+| `cut_out_speed` | `None` | 切出风速 m/s；给定后切出风速以上功率归零视为正常停机，未给则把高风零功率当停机异常。 |
+| `low_power_ratio` | `0.9` | 限电粗洗阈值：风速 ≥ 额定风速时功率 < 该比例×额定功率即判限电。 |
+| `downtime_power` | `1.0` | 功率 ≤ 该值（kW）且风速在切入以上视为停机。 |
+| `bin_width` | `0.5` | 残差分箱宽度 m/s。 |
+| `min_day_points` | `10` | 参与天级判定的最少样本数（每天约 144 点，正常数据下几乎不触发）。 |
+| `min_bin_points` | `3` | 残差 bin 参与判定的最少样本数（同上，兜底用）。 |
+| `z_coeff` | `3.5` | 逐点残差 MAD 倍数，控制残差精洗的**误杀率**：越大保留越多、误杀越少。 |
+| `day_z_coeff` | `2.5` | 天级分数 MAD 倍数，控制"整天判异常"的松紧；真实数据上天级偏移无天然分界、标出天数随该值平滑变化，建议按站点校准。 |
+| `base_method` | `"gam"` | 基准曲线后端：`gam`（默认，单调 GAM）/ `logistic_5_parametric` / `iec`。 |
+| `**base_kwargs` | — | 透传给 `fit_power_curve` 的额外参数。 |
+
+### 调参建议
+
+- **`z_coeff`**：控制逐点残差精洗的误杀率。合成数据 + 真实数据（La Haute Borne R80721）一致显示 `2.5` 偏激进（残差点占比约 9.6%），故默认 `3.5`（约 4%）；若更看重"少动正常点"可放宽到 `4.0`（约 3%）。
+- **`day_z_coeff`**：**不是稳健旋钮**，需按站点校准。合成数据（正常天无系统偏移）上 2.0–6.0 结果一致，但真实数据（La Haute Borne R80721）上天级中位残差呈重尾连续分布（中心 0 kW、MAD 12 kW、尾部 -30~-68 kW），标出的异常天数随它平滑变化：`2.0→38 天`、`2.5→23 天`、`3.0→14 天`、`4.0→2 天`。建议结合已知干净时段或可视化 QC 选定，不要指望换个站点仍适用。
+- **`base_method`**：默认 `gam` 带单调约束 + 网格搜样条数，无需调；`logistic_5_parametric` 的默认 bounds 假设 1.2–1.8 MW，其它机型需显式传 bounds。
+- 其它参数（`bin_width`/`min_day_points`/`min_bin_points`）对结果不敏感，正常数据量下可保持默认。
 
 ## 安装
 

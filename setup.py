@@ -5,7 +5,7 @@ with open("README.md", "r", encoding="utf-8") as fh:
 
 setuptools.setup(
     name="wtclean",
-    version="0.1.0",
+    version="0.2.6",
     description="Wind turbine SCADA power-curve data cleaning via iterative bin + MAD filtering",
     long_description=long_description,
     long_description_content_type="text/markdown",
