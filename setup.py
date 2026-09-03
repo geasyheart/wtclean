@@ -1,6 +1,10 @@
+import os
+
 import setuptools
 
-with open("README.md", "r", encoding="utf-8") as fh:
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+with open(os.path.join(HERE, "README.md"), "r", encoding="utf-8") as fh:
     long_description = fh.read()
 
 setuptools.setup(
@@ -22,7 +26,11 @@ setuptools.setup(
     ],
     packages=setuptools.find_packages(exclude=["test", "examples"]),
     python_requires=">=3.10",
-    install_requires=["numpy", "pandas", "matplotlib"],
+    install_requires=[
+        line.strip()
+        for line in open(os.path.join(HERE, "requirements.txt"), "r", encoding="utf-8")
+        if line.strip() and not line.strip().startswith("#")
+    ],
     keywords=[
         "wind-energy",
         "wind-turbine",
