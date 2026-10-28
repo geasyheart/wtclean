@@ -1,4 +1,4 @@
-__version__ = "0.1.0"
+__version__ = "0.2.26"
 
 from wtclean.modules.power_curve_filtering import PowerCurveFiltering
 from wtclean.modules.daily_anomaly_detection import DailyAnomalyDetector

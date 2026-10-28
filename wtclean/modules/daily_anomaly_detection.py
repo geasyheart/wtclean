@@ -106,7 +106,7 @@ class DailyAnomalyDetector:
 
         Returns:
             按行划分原始 ``df`` 的正常 / 异常两个子集；被判异常的天可通过
-            ``self.abnormal_days_`` 查看。
+            
         """
         work = self.df.copy()
         work["_row_id"] = np.arange(len(work))
@@ -151,8 +151,6 @@ class DailyAnomalyDetector:
         analysis_mask &= ws <= cut_out_eff
 
         if not analysis_mask.any():
-            self.normal_days_ = set()
-            self.abnormal_days_ = set(work["_date"].dropna())
             return self.df.iloc[0:0].copy(), self.df.copy()
 
         # ---- 整机基准曲线 ----
@@ -182,21 +180,15 @@ class DailyAnomalyDetector:
         day_stats = raw_day_stats.loc[count_mask]
 
         if day_stats.empty:
-            self.normal_days_ = set()
-            self.abnormal_days_ = set(work["_date"].dropna())
             return self.df.iloc[0:0].copy(), self.df.copy()
 
         median_resid = day_stats["median"].median()
         mad_resid = (day_stats["median"] - median_resid).abs().median()
-        threshold = k * mad_resid
-        normal_dates = set(
-            day_stats.index[
-                (day_stats["median"] - median_resid).abs() <= threshold
-            ]
+        normal_mask = day_stats["median"].between(
+            median_resid - k * mad_resid, median_resid + k * mad_resid
         )
-        self.normal_days_ = normal_dates
-        self.abnormal_days_ = set(work["_date"].dropna()) - normal_dates
-
+        normal_dates = set(day_stats.index[normal_mask])
+ 
         normal_row_ids = clean_df.loc[
             clean_df["_date"].isin(normal_dates), "_row_id"
         ]
@@ -204,3 +196,4 @@ class DailyAnomalyDetector:
         normal_df = work.loc[is_normal, self.df.columns].copy()
         abnormal_df = work.loc[~is_normal, self.df.columns].copy()
         return normal_df, abnormal_df
+
