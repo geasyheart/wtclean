@@ -3,7 +3,7 @@
 
 对单台风机：先用整机数据拟合基准功率曲线，再按天统计该天的点相对基准曲线的
 系统性偏移，从而把"水平聚集 / 限电 / 降载"这类单点统计方法标不出的异常天揪出来，
-并把异常天内的点整体标记为异常。最终仍输出逐点 normal / abnormal 标签。
+并把异常天内的点整体标记为异常。最终输出 normal / abnormal 两个数据子集。
 """
 
 import numpy as np
@@ -25,14 +25,8 @@ class DailyAnomalyDetector:
         rated_wind_speed: 额定风速；缺省自动反推。
         rated_power: 额定功率；缺省自动反推。
         cut_out_speed: 切出风速（可选）；给定后切出风速以上功率归零视为正常停机。
-        low_power_ratio: 高风区功率低于该比例即视为限电/高风低功率异常。
+        low_power_ratio: 风速达到额定风速后，功率低于该比例×额定功率即视为限电异常。
         downtime_power: 功率低于该值且风速在切入以上视为停机异常。
-        bin_width: 残差分箱宽度。
-        min_day_points: 参与天级判定的最少样本数。
-        min_bin_points: 残差 bin 参与判定的最少样本数。
-        z_coeff: 逐点残差 MAD 倍数（控制逐点残差精洗的误杀率，越大保留越多）。
-        day_z_coeff: 天级分数 MAD 倍数（控制"整天系统性偏移"判定的松紧；真实数据上天级
-            偏移呈重尾连续分布、无天然分界，标出天数随该值平滑变化，建议按站点校准）。
         base_method: 基准曲线后端（gam / logistic / iec）。
     """
 
@@ -42,19 +36,12 @@ class DailyAnomalyDetector:
         power_label: str,
         timestamp_label: str,
         df: pd.DataFrame,
-        #
         cut_in_speed: float | None = None,
         rated_wind_speed: float | None = None,
         rated_power: float | None = None,
         cut_out_speed: float | None = None,
-        #
         low_power_ratio: float = 0.9,
         downtime_power: float = 1.0,
-        bin_width: float = 0.5,
-        min_day_points: int = 10,
-        min_bin_points: int = 3,
-        z_coeff: float = 3.5,
-        day_z_coeff: float = 2.5,
         base_method: str = "gam",
         **base_kwargs,
     ) -> None:
@@ -102,34 +89,24 @@ class DailyAnomalyDetector:
             raise ValueError(
                 f"low_power_ratio must be in (0, 1], got {low_power_ratio}"
             )
-        if bin_width <= 0:
-            raise ValueError(f"bin_width must be > 0, got {bin_width}")
-        if z_coeff <= 0 or day_z_coeff <= 0:
-            raise ValueError("z_coeff and day_z_coeff must be > 0")
-        if min_day_points < 1 or min_bin_points < 1:
-            raise ValueError("min_day_points and min_bin_points must be >= 1")
 
         self.windspeed_label = windspeed_label
         self.power_label = power_label
         self.timestamp_label = timestamp_label
         self.df = df
         self.cut_out_speed = cut_out_speed
-        self.low_power_ratio = low_power_ratio
         self.downtime_power = downtime_power
-        self.bin_width = bin_width
-        self.min_day_points = min_day_points
-        self.min_bin_points = min_bin_points
-        self.z_coeff = z_coeff
-        self.day_z_coeff = day_z_coeff
+        self.low_power_ratio = low_power_ratio
+
         self.base_method = base_method
         self.base_kwargs = base_kwargs
 
     def detect(self) -> tuple[pd.DataFrame, pd.DataFrame]:
-        """运行天维度 + 残差检测，返回 ``(normal_df, abnormal_df)``。
+        """运行天级检测，返回 ``(normal_df, abnormal_df)``。
 
         Returns:
-            按行划分原始 ``df`` 的正常 / 异常两个子集；异常类型可通过
-            ``self.labels_`` 与 ``self.abnormal_days_`` 查看。
+            按行划分原始 ``df`` 的正常 / 异常两个子集；被判异常的天可通过
+            ``self.abnormal_days_`` 查看。
         """
         work = self.df.copy()
         work["_row_id"] = np.arange(len(work))
@@ -173,6 +150,11 @@ class DailyAnomalyDetector:
         analysis_mask = (~nan_mask) & (~range_mask) & (~downtime_mask) & (~curtail_mask)
         analysis_mask &= ws <= cut_out_eff
 
+        if not analysis_mask.any():
+            self.normal_days_ = set()
+            self.abnormal_days_ = set(work["_date"].dropna())
+            return self.df.iloc[0:0].copy(), self.df.copy()
+
         # ---- 整机基准曲线 ----
         self.base_curve_ = fit_power_curve(
             ws[analysis_mask],
@@ -181,75 +163,44 @@ class DailyAnomalyDetector:
             **self.base_kwargs,
         )
 
-        resid = np.full_like(pw, np.nan, dtype=float)
-        finite = np.isfinite(ws) & np.isfinite(pw)
-        resid[finite] = pw[finite] - self.base_curve_(ws[finite])
-        work["_resid"] = resid
-
-        # 逐点标签：normal=正常；其余为各粗洗异常类型（对应上面的掩码）
-        labels = pd.Series("normal", index=work.index, dtype=object)
-        labels[nan_mask] = "nan"  # 缺失：风速/功率为 NaN
-        labels[range_mask] = "range"  # 越界：数值超出物理合理范围
-        labels[downtime_mask] = "downtime"  # 停机：切入风速以上却功率近零
-        labels[curtail_mask] = "curtailment"  # 限电：额定风速以上功率远低于额定
-
-        clean = work[analysis_mask].copy()
-
-        # ---- 天级判定：该天运行段（切入以上）的中位残差 = 系统性偏移 ----
-        op = clean[clean[self.windspeed_label] >= self.cut_in_speed]
-        day_stats = op.groupby("_date")["_resid"].agg(median="median", n="size")
-        day_stats = day_stats[day_stats["n"] >= self.min_day_points]
-
-        self.day_scores_ = day_stats
-        if len(day_stats) >= 3:
-            center = day_stats["median"].median()
-            mad = (day_stats["median"] - center).abs().median()
-            lo = center - self.day_z_coeff * mad
-            abnormal_days = set(day_stats.index[day_stats["median"] < lo].tolist())
-        else:
-            lo = np.nan
-            abnormal_days = set()
-
-        self.abnormal_days_ = abnormal_days
-        self.day_threshold_ = lo
-
-        # ---- 逐点残差 bin-MAD 精洗（异方差）----
-        clean = clean.assign(
-            _bin=np.floor(clean[self.windspeed_label] / self.bin_width).astype("Int64")
+        clean_df = work[analysis_mask].copy()
+        clean_df["_resid"] = clean_df[self.power_label] - self.base_curve_(
+            clean_df[self.windspeed_label]
         )
-        bin_stats = (
-            clean.groupby("_bin")["_resid"]
-            .agg(n="size", med="median", mad=lambda x: (x - x.median()).abs().median())
-            .reset_index()
+
+        # ---- 天级判定：每天中位残差 + 每天点数都用 median ± 3×MAD ----
+        k = 3.0
+        raw_day_stats = clean_df.groupby("_date")["_resid"].agg(
+            median="median", n="size"
         )
-        bin_stats.loc[
-            (bin_stats["n"] < self.min_bin_points) | (bin_stats["mad"] == 0), "mad"
-        ] = np.nan
-        clean = clean.merge(bin_stats[["_bin", "med", "mad"]], on="_bin", how="left")
 
-        resid_outlier = (
-            (clean["_resid"] - clean["med"]).abs() > self.z_coeff * clean["mad"]
-        ) & clean["mad"].notna()
-
-        resid_outlier_ids = clean.loc[resid_outlier, "_row_id"].tolist()
-        temporal_ids = clean.loc[clean["_date"].isin(abnormal_days), "_row_id"].tolist()
-
-        # temporal：时间维度异常——整天的运行段整体偏离基准曲线（限电/降载/停机方向），
-        # 该天内的点整体标为异常（单点看可能落在正常带内，只有整条天曲线对比才现形）
-        labels.loc[work["_row_id"].isin(set(temporal_ids))] = "temporal"
-        # residual：逐点残差异常——单个点相对基准曲线的残差超出该风速 bin 的
-        # z_coeff×MAD 带外（异方差离群点），仅在尚未被标记的点上生效
-        labels.loc[
-            work["_row_id"].isin(set(resid_outlier_ids)) & (labels == "normal")
-        ] = "residual"
-
-        self.labels_ = labels
-        self.removal_counts_ = labels[labels != "normal"].value_counts().to_dict()
-
-        normal_df = work[labels == "normal"].drop(
-            columns=["_row_id", "_date", "_resid"]
+        median_n = raw_day_stats["n"].median()
+        mad_n = (raw_day_stats["n"] - median_n).abs().median()
+        count_mask = raw_day_stats["n"].between(
+            median_n - k * mad_n, median_n + k * mad_n
         )
-        abnormal_df = work[labels != "normal"].drop(
-            columns=["_row_id", "_date", "_resid"]
+        day_stats = raw_day_stats.loc[count_mask]
+
+        if day_stats.empty:
+            self.normal_days_ = set()
+            self.abnormal_days_ = set(work["_date"].dropna())
+            return self.df.iloc[0:0].copy(), self.df.copy()
+
+        median_resid = day_stats["median"].median()
+        mad_resid = (day_stats["median"] - median_resid).abs().median()
+        threshold = k * mad_resid
+        normal_dates = set(
+            day_stats.index[
+                (day_stats["median"] - median_resid).abs() <= threshold
+            ]
         )
+        self.normal_days_ = normal_dates
+        self.abnormal_days_ = set(work["_date"].dropna()) - normal_dates
+
+        normal_row_ids = clean_df.loc[
+            clean_df["_date"].isin(normal_dates), "_row_id"
+        ]
+        is_normal = work["_row_id"].isin(normal_row_ids)
+        normal_df = work.loc[is_normal, self.df.columns].copy()
+        abnormal_df = work.loc[~is_normal, self.df.columns].copy()
         return normal_df, abnormal_df

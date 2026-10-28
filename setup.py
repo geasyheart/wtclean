@@ -9,7 +9,7 @@ with open(os.path.join(HERE, "README.md"), "r", encoding="utf-8") as fh:
 
 setuptools.setup(
     name="wtclean",
-    version="0.2.6",
+    version="0.2.8",
     description="Wind turbine SCADA power-curve data cleaning via iterative bin + MAD filtering",
     long_description=long_description,
     long_description_content_type="text/markdown",
